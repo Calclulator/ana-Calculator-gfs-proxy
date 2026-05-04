@@ -3,10 +3,6 @@
   "version": "0.1.0",
   "description": "GFS GRIB2 fetch + JSON proxy for ana-Calculator (Vercel Functions)",
   "private": true,
-  "main": "api/gfs.js",
-  "engines": {
-    "node": ">=20"
-  },
   "dependencies": {
     "grib2class": "^1.0.7"
   }
