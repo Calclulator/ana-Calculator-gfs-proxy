@@ -5,11 +5,12 @@
 // Query params:
 //   cycle  - YYYYMMDDHH (cycle must end in 00/06/12/18)
 //   fhr    - forecast hour (0..384)
-//   lev    - pressure level in millibars (e.g. 300)
+//   lev    - optional legacy mode: single pressure level in mb (e.g. 300)
+//            default mode fetches fixed levels: 300/275/250/225/200/175/150 mb
 //   west, east, south, north - bbox in degrees
 //   vars   - comma-separated, default UGRD,VGRD,TMP,HGT
 //
-// Example: /api/gfs?cycle=2026050400&fhr=3&lev=300&west=139&east=241&south=29&north=41
+// Example: /api/gfs?cycle=2026050400&fhr=3&west=139&east=241&south=29&north=41
 
 var GRIB2CLASS = require('grib2class');
 
@@ -22,6 +23,7 @@ var VAR_MAP = {
 };
 
 var ALLOWED_VARS = ['UGRD', 'VGRD', 'TMP', 'HGT'];
+var DEFAULT_LEVELS_MB = [300, 275, 250, 225, 200, 175, 150];
 
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -42,7 +44,10 @@ function buildNomadsUrl(p) {
   var file = 'gfs.t' + hh + 'z.pgrb2.0p25.f' + fhr;
   var dir = '/gfs.' + ymd + '/' + hh + '/atmos';
 
-  var qs = ['file=' + file, 'lev_' + p.lev + '_mb=on'];
+  var qs = ['file=' + file];
+  for (var li = 0; li < p.levels.length; li++) {
+    qs.push('lev_' + p.levels[li] + '_mb=on');
+  }
   for (var i = 0; i < p.vars.length; i++) {
     qs.push('var_' + p.vars[i] + '=on');
   }
@@ -112,8 +117,17 @@ function parseMessage(msgBuffer) {
     arr = [];
   }
 
+  var levMb = null;
+  if (typeof grib.ScaledValueOfFirstFixedSurface === 'number' &&
+      !isNaN(grib.ScaledValueOfFirstFixedSurface)) {
+    var rawLev = grib.ScaledValueOfFirstFixedSurface;
+    // Some products expose isobaric level in Pa (e.g. 30000) instead of hPa.
+    levMb = rawLev > 2000 ? (rawLev / 100) : rawLev;
+  }
+
   return {
     name: name,
+    levMb: levMb,
     data: arr,
     nx: grib.Nx,
     ny: grib.Ny,
@@ -152,9 +166,12 @@ module.exports = async function handler(req, res) {
   if (isNaN(fhr) || fhr < 0 || fhr > 384) {
     return bad(res, 400, 'fhr must be integer 0..384');
   }
-  var lev = parseInt(q.lev, 10);
-  if (isNaN(lev) || lev <= 0) {
-    return bad(res, 400, 'lev (mb) required');
+  var legacyLev = null;
+  if (q.lev !== undefined) {
+    legacyLev = parseInt(q.lev, 10);
+    if (isNaN(legacyLev) || legacyLev <= 0) {
+      return bad(res, 400, 'lev (mb) must be positive integer');
+    }
   }
   var west = parseFloat(q.west);
   var east = parseFloat(q.east);
@@ -179,8 +196,10 @@ module.exports = async function handler(req, res) {
     return bad(res, 400, 'no valid vars (allowed: ' + ALLOWED_VARS.join(',') + ')');
   }
 
+  var requestLevels = legacyLev !== null ? [legacyLev] : DEFAULT_LEVELS_MB;
+
   var url = buildNomadsUrl({
-    cycle: q.cycle, fhr: fhr, lev: lev,
+    cycle: q.cycle, fhr: fhr, levels: requestLevels,
     west: west, east: east, south: south, north: north,
     vars: requested
   });
@@ -203,7 +222,7 @@ module.exports = async function handler(req, res) {
       return bad(res, 502, 'no GRIB messages in response (got ' + buf.length + ' bytes)');
     }
 
-    var vars = {};
+    var vars = legacyLev !== null ? {} : {};
     var meta = null;
     var grid = null;
     var parseErrors = [];
@@ -211,7 +230,13 @@ module.exports = async function handler(req, res) {
     for (var m = 0; m < messages.length; m++) {
       try {
         var parsed = parseMessage(messages[m]);
-        vars[parsed.name] = parsed.data;
+        if (legacyLev !== null) {
+          vars[parsed.name] = parsed.data;
+        } else {
+          var levKey = parsed.levMb === null ? 'unknown' : String(parsed.levMb);
+          if (!vars[levKey]) vars[levKey] = {};
+          vars[levKey][parsed.name] = parsed.data;
+        }
         if (!grid) {
           grid = {
             nx: parsed.nx, ny: parsed.ny,
@@ -221,11 +246,15 @@ module.exports = async function handler(req, res) {
           meta = {
             cycle: q.cycle,
             fhr: fhr,
-            lev: lev,
             refTime: parsed.refTime,
             forecastHours: parsed.forecastHours,
             messageCount: messages.length
           };
+          if (legacyLev !== null) {
+            meta.lev = legacyLev;
+          } else {
+            meta.levels = DEFAULT_LEVELS_MB;
+          }
         }
       } catch (e) {
         parseErrors.push({ index: m, error: e.message });

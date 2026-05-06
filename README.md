@@ -5,14 +5,15 @@ NOMADS の GFS GRIB2 データを取得・パースして JSON で返す Vercel 
 ## エンドポイント
 
 ```
-GET /api/gfs?cycle=YYYYMMDDHH&fhr=N&lev=MB&west=W&east=E&south=S&north=N&vars=UGRD,VGRD,TMP,HGT
+GET /api/gfs?cycle=YYYYMMDDHH&fhr=N&west=W&east=E&south=S&north=N&vars=UGRD,VGRD,TMP,HGT
 ```
 
 | パラメータ | 必須 | 例         | 説明                                |
 |------------|------|------------|-------------------------------------|
 | cycle      | yes  | 2026050400 | GFS サイクル (時刻は 00/06/12/18)   |
 | fhr        | yes  | 3          | 予報時間 (0..384)                   |
-| lev        | yes  | 300        | 気圧レベル mb (300/250/200/150 等)  |
+| levels     | fixed| -          | (`lev` 未指定時) 300/275/250/225/200/175/150 mb を常時取得 |
+| lev        | no   | 300        | 旧互換モード。指定時は単一レベルのみ返却 |
 | west       | yes  | 139        | 経度の西端 (-180..360)              |
 | east       | yes  | 241        | 経度の東端 (west < east)            |
 | south      | yes  | 29         | 緯度の南端                          |
@@ -28,10 +29,10 @@ GET /api/gfs?cycle=YYYYMMDDHH&fhr=N&lev=MB&west=W&east=E&south=S&north=N&vars=UG
   "meta": {
     "cycle": "2026050400",
     "fhr": 3,
-    "lev": 300,
+    "levels": [300, 275, 250, 225, 200, 175, 150],
     "refTime": { "year": 2026, "month": 5, "day": 4, "hour": 0, "minute": 0, "second": 0 },
     "forecastHours": 3,
-    "messageCount": 4
+    "messageCount": 28
   },
   "grid": {
     "nx": 409, "ny": 49,
@@ -39,10 +40,13 @@ GET /api/gfs?cycle=YYYYMMDDHH&fhr=N&lev=MB&west=W&east=E&south=S&north=N&vars=UG
     "la2": 29, "lo2": 241
   },
   "vars": {
-    "UGRD": [/* nx*ny floats, 2 decimals */],
-    "VGRD": [...],
-    "TMP":  [...],
-    "HGT":  [...]
+    "300": {
+      "UGRD": [/* nx*ny floats, 2 decimals */],
+      "VGRD": [...],
+      "TMP":  [...],
+      "HGT":  [...]
+    },
+    "275": { "...": "..." }
   }
 }
 ```
@@ -83,7 +87,9 @@ npx vercel dev
 
 ## 1リクエストの粒度
 
-「1 cycle × 1 fhr × 1 level × N vars」で 1 ファイル。複数レベル・複数予報時刻はブラウザ側で並列に呼ぶこと。
+「1 cycle × 1 fhr × 7 levels × N vars」で 1 ファイル。複数予報時刻はブラウザ側で並列に呼ぶこと。
+
+`lev` を指定した場合のみ旧仕様の「1 cycle × 1 fhr × 1 level × N vars」で返す。
 
 ## トラブルシュート
 
