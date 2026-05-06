@@ -24,6 +24,8 @@ var VAR_MAP = {
 
 var ALLOWED_VARS = ['UGRD', 'VGRD', 'TMP', 'HGT'];
 var DEFAULT_LEVELS_MB = [300, 275, 250, 225, 200, 175, 150];
+var PRIMARY_LEVELS_MB = [300, 250, 200, 150];
+var SECONDARY_LEVELS_MB = [275, 225, 175];
 
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -41,7 +43,7 @@ function buildNomadsUrl(p) {
   var hh = p.cycle.slice(8, 10);
   var fhr = String(p.fhr).padStart(3, '0');
 
-  var file = 'gfs.t' + hh + 'z.pgrb2.0p25.f' + fhr;
+  var file = 'gfs.t' + hh + 'z.' + p.filePart + '.0p25.f' + fhr;
   var dir = '/gfs.' + ymd + '/' + hh + '/atmos';
 
   var qs = ['file=' + file];
@@ -58,7 +60,29 @@ function buildNomadsUrl(p) {
   qs.push('bottomlat=' + p.south);
   qs.push('dir=' + encodeURIComponent(dir));
 
-  return 'https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?' + qs.join('&');
+  var script = p.filePart === 'pgrb2b'
+    ? 'filter_gfs_0p25b.pl'
+    : 'filter_gfs_0p25.pl';
+  return 'https://nomads.ncep.noaa.gov/cgi-bin/' + script + '?' + qs.join('&');
+}
+
+function splitLevelsByProduct(levels) {
+  var byProduct = {
+    pgrb2: [],
+    pgrb2b: []
+  };
+  for (var i = 0; i < levels.length; i++) {
+    var lev = levels[i];
+    if (SECONDARY_LEVELS_MB.indexOf(lev) >= 0) {
+      byProduct.pgrb2b.push(lev);
+    } else if (PRIMARY_LEVELS_MB.indexOf(lev) >= 0) {
+      byProduct.pgrb2.push(lev);
+    } else {
+      // Unknown levels default to primary product for backward compatibility.
+      byProduct.pgrb2.push(lev);
+    }
+  }
+  return byProduct;
 }
 
 // Read 32-bit big-endian unsigned int from Buffer.
@@ -198,28 +222,40 @@ module.exports = async function handler(req, res) {
 
   var requestLevels = legacyLev !== null ? [legacyLev] : DEFAULT_LEVELS_MB;
 
-  var url = buildNomadsUrl({
-    cycle: q.cycle, fhr: fhr, levels: requestLevels,
-    west: west, east: east, south: south, north: north,
-    vars: requested
-  });
-
   try {
-    var resp = await fetch(url, {
-      headers: { 'User-Agent': 'ana-Calculator-gfs-proxy/0.1' }
-    });
-    if (!resp.ok) {
-      return bad(res, 502, 'NOMADS responded ' + resp.status + ': ' + resp.statusText);
-    }
-    var ab = await resp.arrayBuffer();
-    var buf = Buffer.from(ab);
-    if (buf.length < 16) {
-      return bad(res, 502, 'empty/short response from NOMADS (' + buf.length + ' bytes)');
-    }
+    var levelGroups = splitLevelsByProduct(requestLevels);
+    var productSpecs = [
+      { key: 'pgrb2', filePart: 'pgrb2', levels: levelGroups.pgrb2 },
+      { key: 'pgrb2b', filePart: 'pgrb2b', levels: levelGroups.pgrb2b }
+    ];
+    var messages = [];
 
-    var messages = splitGribMessages(buf);
-    if (messages.length === 0) {
-      return bad(res, 502, 'no GRIB messages in response (got ' + buf.length + ' bytes)');
+    for (var pi = 0; pi < productSpecs.length; pi++) {
+      var spec = productSpecs[pi];
+      if (!spec.levels.length) continue;
+      var url = buildNomadsUrl({
+        cycle: q.cycle, fhr: fhr, levels: spec.levels, filePart: spec.filePart,
+        west: west, east: east, south: south, north: north,
+        vars: requested
+      });
+      var resp = await fetch(url, {
+        headers: { 'User-Agent': 'ana-Calculator-gfs-proxy/0.1' }
+      });
+      if (!resp.ok) {
+        return bad(res, 502, 'NOMADS ' + spec.filePart + ' responded ' + resp.status + ': ' + resp.statusText);
+      }
+      var ab = await resp.arrayBuffer();
+      var buf = Buffer.from(ab);
+      if (buf.length < 16) {
+        return bad(res, 502, 'empty/short response from NOMADS ' + spec.filePart + ' (' + buf.length + ' bytes)');
+      }
+      var split = splitGribMessages(buf);
+      if (split.length === 0) {
+        return bad(res, 502, 'no GRIB messages in NOMADS ' + spec.filePart + ' response (got ' + buf.length + ' bytes)');
+      }
+      for (var si = 0; si < split.length; si++) {
+        messages.push(split[si]);
+      }
     }
 
     var vars = legacyLev !== null ? {} : {};

@@ -91,6 +91,10 @@ npx vercel dev
 
 `lev` を指定した場合のみ旧仕様の「1 cycle × 1 fhr × 1 level × N vars」で返す。
 
+内部的には level ごとに取得元を切り替える:
+- 300/250/200/150 mb → `filter_gfs_0p25.pl` + `gfs.tHHz.pgrb2.0p25.fHHH`
+- 275/225/175 mb → `filter_gfs_0p25b.pl` + `gfs.tHHz.pgrb2b.0p25.fHHH`
+
 ## トラブルシュート
 
 | 症状                              | 原因/対処                                                                |
