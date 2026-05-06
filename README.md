@@ -39,6 +39,15 @@ GET /api/gfs?cycle=YYYYMMDDHH&fhr=N&west=W&east=E&south=S&north=N&vars=UGRD,VGRD
     "la1": 41, "lo1": 139,
     "la2": 29, "lo2": 241
   },
+  "slices": [
+    {
+      "lev": 300,
+      "u": [/* UGRD */],
+      "v": [/* VGRD */],
+      "t": [/* TMP */],
+      "h": [/* HGT */]
+    }
+  ],
   "vars": {
     "300": {
       "UGRD": [/* nx*ny floats, 2 decimals */],

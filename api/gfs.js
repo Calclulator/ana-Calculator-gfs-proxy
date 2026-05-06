@@ -85,6 +85,31 @@ function splitLevelsByProduct(levels) {
   return byProduct;
 }
 
+function makeNullArray(len) {
+  var arr = new Array(len);
+  for (var i = 0; i < len; i++) arr[i] = null;
+  return arr;
+}
+
+function buildSlices(levels, varsByLevel, grid, includeHgt) {
+  var len = grid && grid.nx && grid.ny ? (grid.nx * grid.ny) : 0;
+  var fallback = makeNullArray(len);
+  var slices = [];
+  for (var i = 0; i < levels.length; i++) {
+    var lev = levels[i];
+    var levVars = varsByLevel[String(lev)] || {};
+    var slice = {
+      lev: lev,
+      u: levVars.UGRD || fallback,
+      v: levVars.VGRD || fallback,
+      t: levVars.TMP || fallback
+    };
+    if (includeHgt) slice.h = levVars.HGT || fallback;
+    slices.push(slice);
+  }
+  return slices;
+}
+
 // Read 32-bit big-endian unsigned int from Buffer.
 function readU32BE(buf, offset) {
   return (buf[offset] * 0x1000000) +
@@ -297,12 +322,28 @@ module.exports = async function handler(req, res) {
       }
     }
 
+    var slices;
+    if (legacyLev !== null) {
+      var legacyLen = grid && grid.nx && grid.ny ? (grid.nx * grid.ny) : 0;
+      var legacyFallback = makeNullArray(legacyLen);
+      slices = [{
+        lev: legacyLev,
+        u: vars.UGRD || legacyFallback,
+        v: vars.VGRD || legacyFallback,
+        t: vars.TMP || legacyFallback,
+        h: vars.HGT || legacyFallback
+      }];
+    } else {
+      slices = buildSlices(DEFAULT_LEVELS_MB, vars, grid, true);
+    }
+
     setCors(res);
     // GFS for a given cycle is stable forever; cache aggressively at the edge.
     res.setHeader('Cache-Control', 'public, s-maxage=21600, max-age=600');
     res.status(200).json({
       meta: meta,
       grid: grid,
+      slices: slices,
       vars: vars,
       parseErrors: parseErrors.length ? parseErrors : undefined
     });
