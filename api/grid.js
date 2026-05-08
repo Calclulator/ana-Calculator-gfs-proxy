@@ -104,12 +104,18 @@ async function fetchJson(url, timeoutMs) {
     const r = await fetch(url, { signal: controller.signal });
     if (!r.ok) {
       const txt = await r.text().catch(() => "");
-      throw new Error(`Open-Meteo HTTP ${r.status}${txt ? `: ${txt.slice(0, 200)}` : ""}`);
+      const err = new Error(`Open-Meteo HTTP ${r.status}${txt ? `: ${txt.slice(0, 200)}` : ""}`);
+      err.status = r.status;
+      throw err;
     }
     return await r.json();
   } finally {
     clearTimeout(timer);
   }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function buildHourlyVars() {
@@ -199,9 +205,12 @@ export default async function handler(req, res) {
   const endDate = isoDateOnly(new Date(validUtc.getTime() + 24 * 3600 * 1000));
   const hourlyVars = buildHourlyVars();
 
-  const batchSize = 50; // recommended
+  const totalCells = nlat * nlon;
+  // Prefer fewer calls to avoid minute-rate limits while staying well under provider point caps.
+  const batchSize = Math.min(500, Math.max(200, totalCells));
   const latBatches = chunkArray(ptsLat, batchSize);
   const lonBatches = chunkArray(ptsLon, batchSize);
+  const batchCount = latBatches.length;
 
   // Prepare output arrays
   const levelsOut = LEVELS_MB.map((mb) => ({
@@ -225,6 +234,18 @@ export default async function handler(req, res) {
   }
 
   try {
+    const t0 = Date.now();
+    let openMeteoCalls = 0;
+    console.log("[grid] start", JSON.stringify({
+      cycle: cycleRaw,
+      fhr: fhr,
+      totalCells: totalCells,
+      nlat: nlat,
+      nlon: nlon,
+      batchSize: batchSize,
+      batchCount: batchCount
+    }));
+
     let p0 = 0;
     for (let b = 0; b < latBatches.length; b++) {
       const latList = latBatches[b].join(",");
@@ -240,7 +261,20 @@ export default async function handler(req, res) {
       url.searchParams.set("hourly", hourlyVars.join(","));
       url.searchParams.set("wind_speed_unit", "ms");
 
-      const data = await fetchJson(url.toString(), 20000);
+      let data;
+      try {
+        openMeteoCalls += 1;
+        data = await fetchJson(url.toString(), 20000);
+      } catch (err) {
+        if (err && err.status === 429) {
+          console.log("[grid] 429 retry", JSON.stringify({ batchIndex: b, waitMs: 1000 }));
+          await sleep(1000);
+          openMeteoCalls += 1;
+          data = await fetchJson(url.toString(), 20000);
+        } else {
+          throw err;
+        }
+      }
 
       // Open-Meteo multi-point returns { latitude:[], longitude:[], hourly:[] } (hourly per point)
       // Handle both shapes: hourly as array (multi) OR object (single).
@@ -283,6 +317,14 @@ export default async function handler(req, res) {
 
       p0 += hourlyArr.length;
     }
+
+    console.log("[grid] done", JSON.stringify({
+      totalCells: totalCells,
+      batchSize: batchSize,
+      batchCount: batchCount,
+      openMeteoCalls: openMeteoCalls,
+      elapsedMs: Date.now() - t0
+    }));
 
     return res.status(200).json({
       cycle: cycleRaw,
