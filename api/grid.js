@@ -135,6 +135,26 @@ function chunkArray(arr, size) {
   return out;
 }
 
+async function runWithConcurrency(items, worker, concurrency) {
+  const results = new Array(items.length);
+  let next = 0;
+  const n = Math.max(1, Math.min(concurrency, items.length || 1));
+
+  async function runner() {
+    while (true) {
+      const idx = next;
+      next += 1;
+      if (idx >= items.length) return;
+      results[idx] = await worker(items[idx], idx);
+    }
+  }
+
+  const runners = [];
+  for (let i = 0; i < n; i++) runners.push(runner());
+  await Promise.all(runners);
+  return results;
+}
+
 export default async function handler(req, res) {
   setCors(res);
 
@@ -206,11 +226,14 @@ export default async function handler(req, res) {
   const hourlyVars = buildHourlyVars();
 
   const totalCells = nlat * nlon;
-  // Prefer fewer calls to avoid minute-rate limits while staying well under provider point caps.
-  const batchSize = Math.min(500, Math.max(200, totalCells));
+  // Fixed safe size to avoid 414 Request-URI Too Large on GET endpoint.
+  const batchSize = 100;
+  const concurrency = 6;
   const latBatches = chunkArray(ptsLat, batchSize);
   const lonBatches = chunkArray(ptsLon, batchSize);
   const batchCount = latBatches.length;
+  const batchOffsets = [];
+  for (let i = 0; i < batchCount; i++) batchOffsets.push(i * batchSize);
 
   // Prepare output arrays
   const levelsOut = LEVELS_MB.map((mb) => ({
@@ -246,8 +269,7 @@ export default async function handler(req, res) {
       batchCount: batchCount
     }));
 
-    let p0 = 0;
-    for (let b = 0; b < latBatches.length; b++) {
+    await runWithConcurrency(batchOffsets, async function (p0, b) {
       const latList = latBatches[b].join(",");
       const lonList = lonBatches[b].join(",");
 
@@ -260,17 +282,23 @@ export default async function handler(req, res) {
       url.searchParams.set("end_date", endDate);
       url.searchParams.set("hourly", hourlyVars.join(","));
       url.searchParams.set("wind_speed_unit", "ms");
+      const urlStr = url.toString();
+      console.log("[grid] batch request", JSON.stringify({
+        batchIndex: b,
+        batchPoints: latBatches[b].length,
+        urlLength: urlStr.length
+      }));
 
       let data;
       try {
         openMeteoCalls += 1;
-        data = await fetchJson(url.toString(), 20000);
+        data = await fetchJson(urlStr, 20000);
       } catch (err) {
         if (err && err.status === 429) {
           console.log("[grid] 429 retry", JSON.stringify({ batchIndex: b, waitMs: 1000 }));
           await sleep(1000);
           openMeteoCalls += 1;
-          data = await fetchJson(url.toString(), 20000);
+          data = await fetchJson(urlStr, 20000);
         } else {
           throw err;
         }
@@ -314,14 +342,13 @@ export default async function handler(req, res) {
           );
         }
       }
-
-      p0 += hourlyArr.length;
-    }
+    }, concurrency);
 
     console.log("[grid] done", JSON.stringify({
       totalCells: totalCells,
       batchSize: batchSize,
       batchCount: batchCount,
+      concurrency: concurrency,
       openMeteoCalls: openMeteoCalls,
       elapsedMs: Date.now() - t0
     }));
