@@ -14,8 +14,8 @@ GET /api/gfs?cycle=YYYYMMDDHH&fhr=N&west=W&east=E&south=S&north=N&vars=UGRD,VGRD
 | fhr        | yes  | 3          | 予報時間 (0..384)                   |
 | levels     | fixed| -          | (`lev` 未指定時) 300/275/250/225/200/175/150 mb を常時取得 |
 | lev        | no   | 300        | 旧互換モード。指定時は単一レベルのみ返却 |
-| west       | yes  | 139        | 経度の西端 (-180..360)              |
-| east       | yes  | 241        | 経度の東端 (west < east)            |
+| west       | yes  | 139        | 西端経度 (-180..360)。東半球は 0–360、dateline 跨ぎは `west` &gt; `east`（例 west=140 east=-120）または unwrap（east&gt;180）も可 |
+| east       | yes  | 241        | 東端経度。proxy 内で 0–360 に正規化し、経度幅に応じて NOMADS 取得を自動分割（≤60° 1本、60–120° 2 分割、&gt;120° 3 分割） |
 | south      | yes  | 29         | 緯度の南端                          |
 | north      | yes  | 41         | 緯度の北端 (south < north)          |
 | vars       | no   | UGRD,VGRD  | カンマ区切り。デフォルト全 4 変数   |

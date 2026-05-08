@@ -1,25 +1,25 @@
 // api/gfs.js
 // GFS GRIB2 proxy for ana-Calculator
 // Fetches from NOMADS grib_filter, parses GRIB2, returns JSON.
+// DL-3: Long-haul bbox is split in longitude (≤60° / 60–120° / >120°), parallel fetch + merge.
 //
 // Query params:
 //   cycle  - YYYYMMDDHH (cycle must end in 00/06/12/18)
 //   fhr    - forecast hour (0..384)
 //   lev    - optional legacy mode: single pressure level in mb (e.g. 300)
 //            default mode fetches fixed levels: 300/275/250/225/200/175/150 mb
-//   west, east, south, north - bbox in degrees
+//   west, east, south, north - bbox in degrees (see README; lonW>lonE dateline form allowed)
 //   vars   - comma-separated, default UGRD,VGRD,TMP,HGT
 //
 // Example: /api/gfs?cycle=2026050400&fhr=3&west=139&east=241&south=29&north=41
 
 var GRIB2CLASS = require('grib2class');
 
-// Variable identification by (discipline, category, parameter) tuple.
 var VAR_MAP = {
-  '0,2,2': 'UGRD',  // U-Component of Wind
-  '0,2,3': 'VGRD',  // V-Component of Wind
-  '0,0,0': 'TMP',   // Temperature
-  '0,3,5': 'HGT'    // Geopotential Height
+  '0,2,2': 'UGRD',
+  '0,2,3': 'VGRD',
+  '0,0,0': 'TMP',
+  '0,3,5': 'HGT'
 };
 
 var ALLOWED_VARS = ['UGRD', 'VGRD', 'TMP', 'HGT'];
@@ -36,6 +36,108 @@ function setCors(res) {
 function bad(res, code, msg) {
   setCors(res);
   res.status(code).json({ error: msg });
+}
+
+function bad502(res, body) {
+  setCors(res);
+  res.status(502).json(body);
+}
+
+function norm360(lon) {
+  var x = lon % 360;
+  if (x < 0) x += 360;
+  return x;
+}
+
+/** One contiguous longitude span in [0,360), width = east - west (east>west). */
+function bboxToNomadsSpans(west, east, south, north) {
+  var w = norm360(west);
+  var e = norm360(east);
+  var spans = [];
+  if (w <= e) {
+    spans.push({ west: w, east: e, south: south, north: north, width: e - w });
+  } else {
+    spans.push({ west: w, east: 360, south: south, north: north, width: 360 - w });
+    spans.push({ west: 0, east: e, south: south, north: north, width: e });
+  }
+  return spans;
+}
+
+function splitCountForWidth(width) {
+  if (width <= 60) return 1;
+  if (width <= 120) return 2;
+  return 3;
+}
+
+function subdivideSpan(span) {
+  var n = splitCountForWidth(span.width);
+  var w0 = span.west;
+  var w1 = span.east;
+  var width = w1 - w0;
+  var parts = [];
+  var i;
+  for (i = 0; i < n; i++) {
+    var sw = w0 + (width * i) / n;
+    var se = w0 + (width * (i + 1)) / n;
+    if (i > 0) sw = Math.round(sw * 10000) / 10000;
+    if (i < n - 1) se = Math.round(se * 10000) / 10000;
+    parts.push({
+      west: sw,
+      east: se,
+      south: span.south,
+      north: span.north,
+      lonW: sw,
+      lonE: se
+    });
+  }
+  return parts;
+}
+
+/** Flat list of sub-bboxes (0–360 lon), west → east across spans and subs. */
+function buildSubBboxes(west, east, south, north) {
+  var spans = bboxToNomadsSpans(west, east, south, north);
+  var subs = [];
+  var si;
+  for (si = 0; si < spans.length; si++) {
+    var parts = subdivideSpan(spans[si]);
+    var pi;
+    for (pi = 0; pi < parts.length; pi++) {
+      subs.push(parts[pi]);
+    }
+  }
+  return { subs: subs, spanCount: spans.length };
+}
+
+function sleep(ms) {
+  return new Promise(function (resolve) {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function fetchWithRetry(url, maxAttempts) {
+  maxAttempts = maxAttempts || 4;
+  var attempt = 0;
+  var lastErr;
+  while (attempt < maxAttempts) {
+    try {
+      var resp = await fetch(url, {
+        headers: { 'User-Agent': 'ana-Calculator-gfs-proxy/0.2' }
+      });
+      if (!resp.ok) {
+        var e = new Error('HTTP ' + resp.status);
+        e.status = resp.status;
+        throw e;
+      }
+      return Buffer.from(await resp.arrayBuffer());
+    } catch (err) {
+      lastErr = err;
+      attempt++;
+      if (attempt >= maxAttempts) break;
+      var backoff = Math.min(2000, Math.round(250 * Math.pow(2, attempt)));
+      await sleep(backoff);
+    }
+  }
+  throw lastErr || new Error('fetch failed');
 }
 
 function buildNomadsUrl(p) {
@@ -78,7 +180,6 @@ function splitLevelsByProduct(levels) {
     } else if (PRIMARY_LEVELS_MB.indexOf(lev) >= 0) {
       byProduct.pgrb2.push(lev);
     } else {
-      // Unknown levels default to primary product for backward compatibility.
       byProduct.pgrb2.push(lev);
     }
   }
@@ -110,7 +211,6 @@ function buildSlices(levels, varsByLevel, grid, includeHgt) {
   return slices;
 }
 
-// Read 32-bit big-endian unsigned int from Buffer.
 function readU32BE(buf, offset) {
   return (buf[offset] * 0x1000000) +
          ((buf[offset + 1] << 16) >>> 0) +
@@ -118,8 +218,6 @@ function readU32BE(buf, offset) {
          buf[offset + 3];
 }
 
-// Split a buffer containing concatenated GRIB2 messages.
-// Each message starts with "GRIB" magic and has 8-byte total length at offset+8.
 function splitGribMessages(buf) {
   var messages = [];
   var i = 0;
@@ -127,7 +225,6 @@ function splitGribMessages(buf) {
   while (i <= n - 16) {
     if (buf[i] === 0x47 && buf[i + 1] === 0x52 &&
         buf[i + 2] === 0x49 && buf[i + 3] === 0x42) {
-      // 8-byte length: high 4 bytes at +8, low 4 bytes at +12.
       var hi = readU32BE(buf, i + 8);
       var lo = readU32BE(buf, i + 12);
       var msgLen = hi * 0x100000000 + lo;
@@ -157,7 +254,6 @@ function parseMessage(msgBuffer) {
     arr = new Array(values.length);
     for (var i = 0; i < values.length; i++) {
       var v = values[i];
-      // Round to 2 decimals to shrink JSON. UGRD/VGRD/TMP/HGT all need < 2 decimals.
       arr[i] = (v === undefined || v === null || isNaN(v))
         ? null
         : Math.round(v * 100) / 100;
@@ -170,7 +266,6 @@ function parseMessage(msgBuffer) {
   if (typeof grib.ScaledValueOfFirstFixedSurface === 'number' &&
       !isNaN(grib.ScaledValueOfFirstFixedSurface)) {
     var rawLev = grib.ScaledValueOfFirstFixedSurface;
-    // Some products expose isobaric level in Pa (e.g. 30000) instead of hPa.
     levMb = rawLev > 2000 ? (rawLev / 100) : rawLev;
   }
 
@@ -190,6 +285,150 @@ function parseMessage(msgBuffer) {
     },
     forecastHours: grib.ForecastConvertedTime
   };
+}
+
+function refTimeKey(rt) {
+  if (!rt) return '';
+  return rt.year + '-' + rt.month + '-' + rt.day + '-' + rt.hour + '-' + (rt.minute || 0);
+}
+
+function metaMismatchMsg(a, b) {
+  return 'meta mismatch: ' + a + ' vs ' + b;
+}
+
+/** Merge parsed GRIB fields of same lev+name, west → east. Returns merged parsed object. */
+function mergeParsedHorizontally(parsedArr) {
+  if (!parsedArr || parsedArr.length === 0) {
+    throw new Error('mergeParsedHorizontally: empty');
+  }
+  if (parsedArr.length === 1) return parsedArr[0];
+
+  var ny0 = parsedArr[0].ny;
+  var nx0 = parsedArr[0].nx;
+  var la1 = parsedArr[0].la1;
+  var la2 = parsedArr[0].la2;
+  var lo1 = parsedArr[0].lo1;
+  var lo2 = parsedArr[0].lo2;
+  var name = parsedArr[0].name;
+  var levMb = parsedArr[0].levMb;
+  var refTime = parsedArr[0].refTime;
+  var forecastHours = parsedArr[0].forecastHours;
+  var z;
+  for (z = 1; z < parsedArr.length; z++) {
+    if (parsedArr[z].ny !== ny0) throw new Error(metaMismatchMsg('ny', parsedArr[z].ny + '!=' + ny0));
+    if (Math.abs(parsedArr[z].la1 - la1) > 0.02) throw new Error(metaMismatchMsg('la1', ''));
+    if (Math.abs(parsedArr[z].la2 - la2) > 0.02) throw new Error(metaMismatchMsg('la2', ''));
+    if (parsedArr[z].name !== name) throw new Error(metaMismatchMsg('name', ''));
+    if (String(parsedArr[z].levMb) !== String(levMb)) throw new Error(metaMismatchMsg('levMb', ''));
+    if (refTimeKey(parsedArr[z].refTime) !== refTimeKey(refTime)) {
+      throw new Error(metaMismatchMsg('refTime', ''));
+    }
+    if (parsedArr[z].forecastHours !== forecastHours) {
+      throw new Error(metaMismatchMsg('forecastHours', ''));
+    }
+  }
+
+  var dlon = (lo2 - lo1) / Math.max(1, nx0 - 1);
+  var mergedData = parsedArr[0].data.slice();
+  var curNx = nx0;
+  var curLo2 = lo2;
+  var k;
+  for (k = 1; k < parsedArr.length; k++) {
+    var p = parsedArr[k];
+    var nxk = p.nx;
+    var dlonK = (p.lo2 - p.lo1) / Math.max(1, nxk - 1);
+    if (Math.abs(dlon - dlonK) > 0.0005) {
+      throw new Error(metaMismatchMsg('dlon', dlon + ' vs ' + dlonK));
+    }
+
+    var shift = 0;
+    while (shift < 4 && p.lo1 + shift * 360 < curLo2 - dlon * 0.5) shift++;
+    while (shift > -4 && p.lo1 + shift * 360 > curLo2 + dlon * 1.5) shift--;
+    var pLo1 = p.lo1 + shift * 360;
+    var pLo2 = p.lo2 + shift * 360;
+
+    var overlap = 1;
+    var gapCells = Math.abs((pLo1 - curLo2) / dlon);
+    if (gapCells < 0.25) overlap = 1;
+    else if (gapCells < 1.25) overlap = 1;
+    else overlap = 0;
+
+    if (overlap > curNx || overlap > nxk) overlap = 0;
+
+    var newNx = curNx + nxk - overlap;
+    var newData = new Array(newNx * ny0);
+    var iy;
+    for (iy = 0; iy < ny0; iy++) {
+      var ix;
+      for (ix = 0; ix < curNx; ix++) {
+        newData[iy * newNx + ix] = mergedData[iy * curNx + ix];
+      }
+      var j;
+      for (j = 0; j < nxk - overlap; j++) {
+        newData[iy * newNx + curNx - overlap + j] = p.data[iy * nxk + overlap + j];
+      }
+    }
+    mergedData = newData;
+    curNx = newNx;
+    curLo2 = pLo2;
+  }
+
+  return {
+    name: name,
+    levMb: levMb,
+    data: mergedData,
+    nx: curNx,
+    ny: ny0,
+    la1: la1,
+    lo1: lo1,
+    la2: la2,
+    lo2: curLo2,
+    refTime: refTime,
+    forecastHours: forecastHours
+  };
+}
+
+/** Per sub: map "lev\tname" -> parsed. Merge each key west→east across subs. */
+function mergeMessagesFromSubs(subParsedArrays) {
+  var nSubs = subParsedArrays.length;
+  var maps = [];
+  var si;
+  var mj;
+  var p;
+  var k;
+  for (si = 0; si < nSubs; si++) {
+    var m = {};
+    for (mj = 0; mj < subParsedArrays[si].length; mj++) {
+      p = subParsedArrays[si][mj];
+      k = (p.levMb === null ? 'unknown' : String(p.levMb)) + '\t' + p.name;
+      if (m[k]) {
+        throw new Error(metaMismatchMsg('duplicate in sub', String(si) + ' ' + k));
+      }
+      m[k] = p;
+    }
+    maps.push(m);
+  }
+  var allKeys = {};
+  for (si = 0; si < nSubs; si++) {
+    for (k in maps[si]) {
+      if (Object.prototype.hasOwnProperty.call(maps[si], k)) {
+        allKeys[k] = true;
+      }
+    }
+  }
+  var mergedList = [];
+  for (k in allKeys) {
+    if (!Object.prototype.hasOwnProperty.call(allKeys, k)) continue;
+    var chain = [];
+    for (si = 0; si < nSubs; si++) {
+      if (!maps[si][k]) {
+        throw new Error('missing layer in sub ' + si + ': ' + k);
+      }
+      chain.push(maps[si][k]);
+    }
+    mergedList.push(mergeParsedHorizontally(chain));
+  }
+  return mergedList;
 }
 
 module.exports = async function handler(req, res) {
@@ -247,39 +486,102 @@ module.exports = async function handler(req, res) {
 
   var requestLevels = legacyLev !== null ? [legacyLev] : DEFAULT_LEVELS_MB;
 
+  var bboxInfo = buildSubBboxes(west, east, south, north);
+  var subs = bboxInfo.subs;
+  var t0 = Date.now();
+
   try {
     var levelGroups = splitLevelsByProduct(requestLevels);
     var productSpecs = [
       { key: 'pgrb2', filePart: 'pgrb2', levels: levelGroups.pgrb2 },
       { key: 'pgrb2b', filePart: 'pgrb2b', levels: levelGroups.pgrb2b }
     ];
-    var messages = [];
 
-    for (var pi = 0; pi < productSpecs.length; pi++) {
+    var allMergedParsed = [];
+    var totalRawMessages = 0;
+    var pi;
+
+    for (pi = 0; pi < productSpecs.length; pi++) {
       var spec = productSpecs[pi];
       if (!spec.levels.length) continue;
-      var url = buildNomadsUrl({
-        cycle: q.cycle, fhr: fhr, levels: spec.levels, filePart: spec.filePart,
-        west: west, east: east, south: south, north: north,
-        vars: requested
+
+      var fetchTasks = subs.map(function (sub) {
+        var url = buildNomadsUrl({
+          cycle: q.cycle,
+          fhr: fhr,
+          levels: spec.levels,
+          filePart: spec.filePart,
+          west: sub.west,
+          east: sub.east,
+          south: south,
+          north: north,
+          vars: requested
+        });
+        return (async function () {
+          try {
+            var buf = await fetchWithRetry(url, 4);
+            return { sub: sub, buf: buf, ok: true };
+          } catch (err) {
+            return { sub: sub, err: err, ok: false };
+          }
+        })();
       });
-      var resp = await fetch(url, {
-        headers: { 'User-Agent': 'ana-Calculator-gfs-proxy/0.1' }
-      });
-      if (!resp.ok) {
-        return bad(res, 502, 'NOMADS ' + spec.filePart + ' responded ' + resp.status + ': ' + resp.statusText);
+
+      var results = await Promise.all(fetchTasks);
+      var ri;
+      for (ri = 0; ri < results.length; ri++) {
+        if (!results[ri].ok) {
+          console.error('[gfs] sub fetch failed', spec.filePart, results[ri].sub, results[ri].err && results[ri].err.message);
+          return bad502(res, {
+            error: 'NOMADS sub fetch failed after retries',
+            failedSubBbox: { lonW: results[ri].sub.lonW, lonE: results[ri].sub.lonE }
+          });
+        }
+        var buf = results[ri].buf;
+        if (buf.length < 16) {
+          return bad502(res, {
+            error: 'empty/short response from NOMADS ' + spec.filePart + ' (' + buf.length + ' bytes)',
+            failedSubBbox: { lonW: results[ri].sub.lonW, lonE: results[ri].sub.lonE }
+          });
+        }
+        var split = splitGribMessages(buf);
+        if (split.length === 0) {
+          return bad502(res, {
+            error: 'no GRIB messages in NOMADS ' + spec.filePart + ' response',
+            failedSubBbox: { lonW: results[ri].sub.lonW, lonE: results[ri].sub.lonE }
+          });
+        }
+        totalRawMessages += split.length;
       }
-      var ab = await resp.arrayBuffer();
-      var buf = Buffer.from(ab);
-      if (buf.length < 16) {
-        return bad(res, 502, 'empty/short response from NOMADS ' + spec.filePart + ' (' + buf.length + ' bytes)');
+
+      var subParsedArrays = [];
+      for (ri = 0; ri < results.length; ri++) {
+        var buf2 = results[ri].buf;
+        var split2 = splitGribMessages(buf2);
+        var parsedList = [];
+        var sj;
+        for (sj = 0; sj < split2.length; sj++) {
+          try {
+            parsedList.push(parseMessage(split2[sj]));
+          } catch (pe) {
+            parsedList.push(null);
+          }
+        }
+        subParsedArrays.push(parsedList.filter(Boolean));
       }
-      var split = splitGribMessages(buf);
-      if (split.length === 0) {
-        return bad(res, 502, 'no GRIB messages in NOMADS ' + spec.filePart + ' response (got ' + buf.length + ' bytes)');
-      }
-      for (var si = 0; si < split.length; si++) {
-        messages.push(split[si]);
+
+      try {
+        var mergedForProduct = mergeMessagesFromSubs(subParsedArrays);
+        var mj;
+        for (mj = 0; mj < mergedForProduct.length; mj++) {
+          allMergedParsed.push(mergedForProduct[mj]);
+        }
+      } catch (mergeErr) {
+        console.error('[gfs] merge/meta', mergeErr.message);
+        return bad502(res, {
+          error: mergeErr.message || 'merge failed',
+          reason: 'meta_mismatch'
+        });
       }
     }
 
@@ -288,28 +590,31 @@ module.exports = async function handler(req, res) {
     var grid = null;
     var parseErrors = [];
 
-    for (var m = 0; m < messages.length; m++) {
+    for (var m = 0; m < allMergedParsed.length; m++) {
       try {
-        var parsed = parseMessage(messages[m]);
+        var parsed = allMergedParsed[m];
         if (legacyLev !== null) {
           vars[parsed.name] = parsed.data;
         } else {
-          var levKey = parsed.levMb === null ? 'unknown' : String(parsed.levMb);
-          if (!vars[levKey]) vars[levKey] = {};
-          vars[levKey][parsed.name] = parsed.data;
+          var levKey2 = parsed.levMb === null ? 'unknown' : String(parsed.levMb);
+          if (!vars[levKey2]) vars[levKey2] = {};
+          vars[levKey2][parsed.name] = parsed.data;
         }
         if (!grid) {
           grid = {
-            nx: parsed.nx, ny: parsed.ny,
-            la1: parsed.la1, lo1: parsed.lo1,
-            la2: parsed.la2, lo2: parsed.lo2
+            nx: parsed.nx,
+            ny: parsed.ny,
+            la1: parsed.la1,
+            lo1: parsed.lo1,
+            la2: parsed.la2,
+            lo2: parsed.lo2
           };
           meta = {
             cycle: q.cycle,
             fhr: fhr,
             refTime: parsed.refTime,
             forecastHours: parsed.forecastHours,
-            messageCount: messages.length
+            messageCount: allMergedParsed.length
           };
           if (legacyLev !== null) {
             meta.lev = legacyLev;
@@ -337,8 +642,20 @@ module.exports = async function handler(req, res) {
       slices = buildSlices(DEFAULT_LEVELS_MB, vars, grid, true);
     }
 
+    var elapsed = Date.now() - t0;
+    console.log(JSON.stringify({
+      tag: 'gfs-bbox-split',
+      splitSubCount: subs.length,
+      spanCount: bboxInfo.spanCount,
+      subBboxes: subs.map(function (s) {
+        return { lonW: s.lonW, lonE: s.lonE };
+      }),
+      fetchMs: elapsed,
+      messageCount: meta.messageCount,
+      rawMessageTotal: totalRawMessages
+    }));
+
     setCors(res);
-    // GFS for a given cycle is stable forever; cache aggressively at the edge.
     res.setHeader('Cache-Control', 'public, s-maxage=21600, max-age=600');
     res.status(200).json({
       meta: meta,
@@ -347,7 +664,6 @@ module.exports = async function handler(req, res) {
       vars: vars,
       parseErrors: parseErrors.length ? parseErrors : undefined
     });
-
   } catch (err) {
     console.error('handler error:', err);
     return bad(res, 500, err.message || 'internal error');
