@@ -131,6 +131,7 @@ async function fetchWithRetry(url, maxAttempts) {
       return Buffer.from(await resp.arrayBuffer());
     } catch (err) {
       lastErr = err;
+      if (err.status && err.status < 500) break;
       attempt++;
       if (attempt >= maxAttempts) break;
       var backoff = Math.min(2000, Math.round(250 * Math.pow(2, attempt)));
