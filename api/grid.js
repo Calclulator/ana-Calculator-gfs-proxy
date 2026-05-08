@@ -228,7 +228,9 @@ export default async function handler(req, res) {
   const totalCells = nlat * nlon;
   // Fixed safe size to avoid 414 Request-URI Too Large on GET endpoint.
   const batchSize = 100;
-  const concurrency = 6;
+  const concurrency = 2;
+  const throttleMs = 100;
+  const abortAfterMs = 8000;
   const latBatches = chunkArray(ptsLat, batchSize);
   const lonBatches = chunkArray(ptsLon, batchSize);
   const batchCount = latBatches.length;
@@ -259,6 +261,7 @@ export default async function handler(req, res) {
   try {
     const t0 = Date.now();
     let openMeteoCalls = 0;
+    let nextBatchEarliestMs = t0;
     console.log("[grid] start", JSON.stringify({
       cycle: cycleRaw,
       fhr: fhr,
@@ -266,10 +269,26 @@ export default async function handler(req, res) {
       nlat: nlat,
       nlon: nlon,
       batchSize: batchSize,
-      batchCount: batchCount
+      batchCount: batchCount,
+      concurrency: concurrency,
+      throttleMs: throttleMs,
+      abortAfterMs: abortAfterMs
     }));
 
     await runWithConcurrency(batchOffsets, async function (p0, b) {
+      if (Date.now() - t0 >= abortAfterMs) {
+        throw new Error("grid processing exceeded internal time budget");
+      }
+      const now = Date.now();
+      const waitMs = Math.max(0, nextBatchEarliestMs - now);
+      nextBatchEarliestMs = now + waitMs + throttleMs;
+      if (waitMs > 0) await sleep(waitMs);
+      console.log("[grid] batch start", JSON.stringify({
+        batchIndex: b,
+        ts: new Date().toISOString(),
+        waitMs: waitMs
+      }));
+
       const latList = latBatches[b].join(",");
       const lonList = lonBatches[b].join(",");
 
@@ -342,6 +361,10 @@ export default async function handler(req, res) {
           );
         }
       }
+      console.log("[grid] batch done", JSON.stringify({
+        batchIndex: b,
+        ts: new Date().toISOString()
+      }));
     }, concurrency);
 
     console.log("[grid] done", JSON.stringify({
