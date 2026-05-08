@@ -219,6 +219,8 @@ export default async function handler(req, res) {
       return res.status(502).json({ error: "no valid pressure-level values found" });
     }
 
+    // Same query returns stable data for a cycle/fhr window; cache at Vercel edge.
+    res.setHeader("Cache-Control", "public, s-maxage=21600, stale-while-revalidate=43200");
     return res.status(200).json({
       cycle: String(cycleRaw),
       fhr: fhr,
