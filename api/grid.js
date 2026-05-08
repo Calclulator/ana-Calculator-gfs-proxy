@@ -376,6 +376,8 @@ export default async function handler(req, res) {
       elapsedMs: Date.now() - t0
     }));
 
+    // Same cycle/fhr/bbox/step response is stable; cache at Vercel edge.
+    res.setHeader("Cache-Control", "public, s-maxage=21600, stale-while-revalidate=43200");
     return res.status(200).json({
       cycle: cycleRaw,
       fhr: fhr,
