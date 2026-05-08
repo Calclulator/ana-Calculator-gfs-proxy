@@ -16,7 +16,14 @@
 
 const LEVELS_MB = [300, 275, 250, 225, 200, 175, 150];
 
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
 function badRequest(res, message) {
+  setCors(res);
   return res.status(400).json({ error: message });
 }
 
@@ -104,8 +111,14 @@ async function fetchJson(url, timeoutMs) {
 }
 
 export default async function handler(req, res) {
+  setCors(res);
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
   if (req.method !== "GET") {
-    res.setHeader("Allow", "GET");
+    res.setHeader("Allow", "GET, OPTIONS");
     return res.status(405).json({ error: "Method Not Allowed" });
   }
 
