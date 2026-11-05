@@ -14,7 +14,7 @@
 //   ]
 // }
 
-const LEVELS_MB = [300, 275, 250, 225, 200, 175, 150];
+const LEVELS_MB = [400, 300, 275, 250, 225, 200, 175, 150];
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
